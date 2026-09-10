@@ -1,0 +1,101 @@
+name: Frontend Continuous Integration
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - "starter/frontend/**"
+      - ".github/workflows/frontend-ci.yaml"
+      - ".github/actions/frontend-deps/**"
+
+env:
+  # Placeholder API URL so `npm run build` can complete during CI even
+  # though there is no real backend to point at yet. CD uses the real one.
+  REACT_APP_MOVIE_API_URL: "http://localhost:5000"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS, restore cache, install dependencies
+        uses: ./.github/actions/frontend-deps
+
+      - name: Run npm run lint
+        working-directory: starter/frontend
+        run: npm run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS, restore cache, install dependencies
+        uses: ./.github/actions/frontend-deps
+
+      - name: Run npm run test
+        working-directory: starter/frontend
+        run: npm test
+        env:
+          CI: true
+
+  build:
+    name: Build
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS, restore cache, install dependencies
+        uses: ./.github/actions/frontend-deps
+
+      # CI only proves the Dockerfile builds cleanly; nothing is pushed
+      # or deployed from this workflow.
+      - name: Build application with Docker
+        working-directory: starter/frontend
+        run: |
+          docker build \
+            --build-arg REACT_APP_MOVIE_API_URL=$REACT_APP_MOVIE_API_URL \
+            --tag mp-frontend:ci-${{ github.sha }} .
+
+  comment-on-pr:
+    name: Comment CI result on PR
+    needs: [lint, test, build]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post summary comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              lint: '${{ needs.lint.result }}',
+              test: '${{ needs.test.result }}',
+              build: '${{ needs.build.result }}',
+            };
+            const icon = (r) => (r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌');
+            const body = [
+              '### Frontend CI result',
+              `- Lint: ${icon(results.lint)} ${results.lint}`,
+              `- Test: ${icon(results.test)} ${results.test}`,
+              `- Build: ${icon(results.build)} ${results.build}`,
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Fail workflow if any job failed
+        if: contains(needs.*.result, 'failure')
+        run: exit 1

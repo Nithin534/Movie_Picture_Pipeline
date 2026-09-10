@@ -1,0 +1,168 @@
+name: Backend Continuous Deployment
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "starter/backend/**"
+      - ".github/workflows/backend-cd.yaml"
+      - ".github/actions/backend-deps/**"
+
+env:
+  # Fixed by the project's Terraform template (setup/terraform) - not secrets.
+  AWS_REGION: "us-east-1"
+  ECR_REPOSITORY: "backend"
+  EKS_CLUSTER_NAME: "cluster"
+  K8S_NAMESPACE: default
+  K8S_DEPLOYMENT: backend
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python, restore cache, install dependencies
+        uses: ./.github/actions/backend-deps
+
+      - name: Run flake8
+        working-directory: starter/backend
+        run: pipenv run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python, restore cache, install dependencies
+        uses: ./.github/actions/backend-deps
+
+      - name: Run pytest
+        working-directory: starter/backend
+        run: pipenv run test
+
+  build-and-push:
+    name: Build & push image to ECR
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Credentials come from GitHub Secrets only - never hardcoded.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build application with Docker
+        id: build-image
+        working-directory: starter/backend
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: docker build --tag "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+
+      - name: Push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to EKS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      # Team convention (per dev notes): point the kustomization at the
+      # exact image built above, then render + apply with kubectl. Only
+      # edits kustomization.yaml in this job's ephemeral checkout -
+      # nothing is committed back to the repo.
+      - name: Set image tag with kustomize
+        working-directory: starter/backend/k8s
+        run: kustomize edit set image backend=${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy application with kubectl
+        working-directory: starter/backend/k8s
+        run: kustomize build | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/"$K8S_DEPLOYMENT" -n "$K8S_NAMESPACE" --timeout=180s
+
+      - name: Verify pods and service
+        run: |
+          kubectl get pods -n "$K8S_NAMESPACE" -l app="$K8S_DEPLOYMENT"
+          kubectl get svc "$K8S_DEPLOYMENT" -n "$K8S_NAMESPACE"
+
+      - name: Smoke test backend endpoint
+        # Waits for the LoadBalancer hostname to resolve, then hits it.
+        # Non-fatal if the LB DNS hasn't propagated yet - deploy already
+        # succeeded per rollout status above.
+        continue-on-error: true
+        run: |
+          HOSTNAME=$(kubectl get svc "$K8S_DEPLOYMENT" -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Backend URL: http://$HOSTNAME"
+          for i in $(seq 1 10); do
+            if RESPONSE=$(curl -sf "http://$HOSTNAME/movies"); then
+              echo "Backend responded successfully:"
+              echo "$RESPONSE"
+              exit 0
+            fi
+            echo "Waiting for backend to respond... ($i/10)"
+            sleep 15
+          done
+          echo "Backend did not respond in time (non-blocking)." >&2
+
+  notify-on-failure:
+    name: Notify on failure
+    needs: [lint, test, build-and-push, deploy]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize failure
+        run: |
+          echo "### Backend deployment FAILED" >> "$GITHUB_STEP_SUMMARY"
+          echo "- lint: ${{ needs.lint.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- test: ${{ needs.test.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- build-and-push: ${{ needs.build-and-push.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- deploy: ${{ needs.deploy.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Triggered by: ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Optional: uncomment once SLACK_WEBHOOK_URL secret is configured.
+      # - name: Slack notification
+      #   uses: 8398a7/action-slack@v3
+      #   with:
+      #     status: failure
+      #     text: "Backend CD failed on ${{ github.sha }} (triggered by ${{ github.actor }})"
+      #   env:
+      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

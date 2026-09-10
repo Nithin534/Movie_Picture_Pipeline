@@ -1,0 +1,34 @@
+name: "Frontend dependency setup"
+description: >
+  Sets up NodeJS (version pinned by starter/frontend/.nvmrc), restores the
+  npm cache, and installs dependencies. Assumes the caller already ran
+  actions/checkout. Used by every lint/test/build job in frontend-ci.yaml
+  and frontend-cd.yaml so the setup/cache/install sequence is defined once.
+
+inputs:
+  working-directory:
+    description: "Path to the frontend app"
+    required: false
+    default: "starter/frontend"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup NodeJS
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: ${{ inputs.working-directory }}/.nvmrc
+
+    - name: Cache node modules
+      id: npm-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-npm-${{ hashFiles(format('{0}/package-lock.json', inputs.working-directory)) }}
+        restore-keys: |
+          ${{ runner.os }}-npm-
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: npm ci
