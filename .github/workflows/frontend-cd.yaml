@@ -58,7 +58,7 @@ jobs:
     outputs:
       # Full ECR image reference, tagged with the commit SHA that
       # triggered this run (via the GitHub context).
-      image: ${{ steps.build-image.outputs.image }}
+      image: ${{ steps.push-image.outputs.image }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -91,6 +91,7 @@ jobs:
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Push image to ECR
+        id: push-image
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
